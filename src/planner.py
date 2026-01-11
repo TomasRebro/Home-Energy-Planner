@@ -214,54 +214,67 @@ def load_ote_15min_prices_eur_per_mwh(ote_url: str, tz: dt.tzinfo) -> pd.DataFra
 
 def load_cnb_eur_czk_rate(cnb_url: str, for_date: dt.date) -> float:
     """
-    Returns EUR→CZK rate for a given date from the CNB XLSX.
-    Heuristic parser since formats vary a bit.
+    CNB sheet layout (per screenshot):
+      columns: Den | Kurz | Měna
+      Den formatted like dd/mm/yyyy
+      Kurz is numeric (CZK per 1 EUR)
+      Měna is 'EUR'
+
+    Returns EUR→CZK for the given date, or nearest previous date if missing.
     """
     xlsx = http_get_bytes(cnb_url)
-    df = read_excel_bytes(xlsx)
 
-    # Try to find a date column
-    date_col = None
-    for c in df.columns:
-        s = str(c).lower()
-        if "datum" in s or "date" in s:
-            date_col = c
+    # Read without assuming header row; we'll find the header by content
+    df = read_excel_bytes(xlsx, header=None)
+
+    # Find the header row containing "Den" and "Kurz" and "Měna"
+    header_row_idx = None
+    for i in range(min(50, len(df))):
+        row_vals = [str(v).strip().lower() for v in df.iloc[i].tolist() if not pd.isna(v)]
+        if ("den" in row_vals) and ("kurz" in row_vals) and (("měna" in row_vals) or ("mena" in row_vals)):
+            header_row_idx = i
             break
 
-    if date_col is None:
-        # fallback: first column might be date
-        date_col = df.columns[0]
+    if header_row_idx is None:
+        raise RuntimeError("Could not find CNB header row with columns Den/Kurz/Měna.")
 
-    # Find EUR column: could be "EUR", "EUR/CZK", etc.
-    eur_col = None
-    for c in df.columns:
-        s = str(c).upper()
-        if s.strip() == "EUR" or "EUR" in s:
-            eur_col = c
-            break
+    # Re-read using that row as header
+    df2 = read_excel_bytes(xlsx, header=header_row_idx)
 
-    if eur_col is None:
-        # fallback: search in first few rows for "EUR" header-like
-        raise RuntimeError("Could not find EUR column in CNB XLSX.")
+    # Normalize column names (handle diacritics variants)
+    cols = {str(c).strip().lower(): c for c in df2.columns}
+    den_col = cols.get("den")
+    kurz_col = cols.get("kurz")
+    mena_col = cols.get("měna") or cols.get("mena")
 
-    df2 = df.copy()
-    df2[date_col] = pd.to_datetime(df2[date_col], errors="coerce").dt.date
-    df2[eur_col] = pd.to_numeric(df2[eur_col], errors="coerce")
+    if not den_col or not kurz_col or not mena_col:
+        raise RuntimeError(f"Expected columns Den/Kurz/Měna, got: {list(df2.columns)}")
 
-    row = df2[df2[date_col] == for_date]
-    if row.empty:
-        # some sheets might list business days only; try nearest previous day
-        earlier = df2.dropna(subset=[date_col, eur_col]).sort_values(date_col)
-        earlier = earlier[earlier[date_col] <= for_date]
-        if earlier.empty:
-            raise RuntimeError(f"No CNB EUR rate found on or before {for_date}.")
-        rate = float(earlier.iloc[-1][eur_col])
-        return rate
+    # Parse
+    out = df2[[den_col, kurz_col, mena_col]].copy()
+    out = out.rename(columns={den_col: "date", kurz_col: "rate", mena_col: "ccy"})
 
-    rate = float(row.iloc[0][eur_col])
-    if not (0 < rate < 1000):
-        raise RuntimeError(f"CNB EUR rate looks invalid: {rate}")
-    return rate
+    # Den is dd/mm/yyyy
+    out["date"] = pd.to_datetime(out["date"], dayfirst=True, errors="coerce").dt.date
+    out["rate"] = pd.to_numeric(out["rate"], errors="coerce")
+    out["ccy"] = out["ccy"].astype(str).str.strip().str.upper()
+
+    out = out.dropna(subset=["date", "rate"])
+    out = out[out["ccy"] == "EUR"].sort_values("date")
+
+    if out.empty:
+        raise RuntimeError("CNB sheet parsed but no EUR rows found.")
+
+    # Exact date first; otherwise nearest previous date
+    exact = out[out["date"] == for_date]
+    if not exact.empty:
+        return float(exact.iloc[0]["rate"])
+
+    prev = out[out["date"] <= for_date]
+    if prev.empty:
+        raise RuntimeError(f"No CNB EUR rate found on or before {for_date}.")
+
+    return float(prev.iloc[-1]["rate"])
 
 
 def load_ha_tomorrow_pv_kwh(ha_base_url: str, ha_token: str, entity_id: str) -> float:
@@ -375,6 +388,7 @@ def main() -> int:
     # pv_kwh = load_ha_tomorrow_pv_kwh(args.ha_base_url, args.ha_token, args.pv_entity)
     pv_kwh = 0.0
     eur_czk = load_cnb_eur_czk_rate(cnb_url, plan_date)
+    print(f"EUR→CZK rate used: {eur_czk:.4f}")
     ote_df = load_ote_15min_prices_eur_per_mwh(ote_url, tz=tz)
 
     # Convert OTE prices to CZK/MWh

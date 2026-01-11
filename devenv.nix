@@ -6,11 +6,26 @@ in
   # https://devenv.sh/basics/
   env.GREET = "devenv";
 
+  languages.python = {
+    enable = true;
+
+    # Use the Nix-provided Python you want (your 3.14 from unstable):
+    package = pkgs-unstable.python314;
+
+    poetry = {
+      enable = true;
+
+      # Automatically activate the poetry venv when you run `devenv shell`
+      activate.enable = true;
+
+      # Automatically run `poetry install` during devenv initialization
+      install.enable = true;
+    };
+  };
+
   # https://devenv.sh/packages/
   packages = [
     pkgs.git
-    pkgs-unstable.python314
-    pkgs-unstable.poetry
   ];
 
   # https://devenv.sh/languages/
