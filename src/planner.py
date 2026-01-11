@@ -26,7 +26,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -336,6 +336,7 @@ def load_cnb_eur_czk_rate(cnb_url: str, for_date: dt.date) -> float:
     if prev.empty:
         raise RuntimeError(f"No CNB EUR rate found on or before {for_date}.")
 
+    print(f"Using CNB EUR rate for date: {prev.iloc[-1]['date']}")
     return float(prev.iloc[-1]["rate"])
 
 
@@ -495,7 +496,9 @@ def main() -> int:
         plan_date = (now + dt.timedelta(days=1)).date()
 
     ote_url = args.ote_url or build_ote_url(plan_date)
-    cnb_url = args.cnb_url or build_cnb_url(plan_date)
+    cnb_url = args.cnb_url or build_cnb_url(
+        now.date()
+    )  # Use today's rate for planning, because CNB rates are updated daily
 
     if not args.ha_base_url or not args.ha_token:
         print(
@@ -533,8 +536,63 @@ def main() -> int:
     # Determine how much grid energy is needed (default goal: end of tomorrow = full battery)
     capacity = args.battery_capacity_kwh
 
+    # --- Morning reserve logic ---
+    # We want to ensure there is enough energy to cover consumption until 09:00 and still have
+    # at least 10% of battery left as a reserve.
+    reserve_fraction = 0.10
+    reserve_kwh = capacity * reserve_fraction
+
+    # Average consumption: 300 Wh/h + 10% (dishwasher factor)
+    avg_consumption_kwh_per_h = 0.300
+    dishwasher_factor = 1.10
+
+    now_local = dt.datetime.now(tz)
+
+    # Next occurrence of 09:00 local time
+    nine_am_today = dt.datetime.combine(now_local.date(), dt.time(9, 0), tzinfo=tz)
+    nine_am = (
+        nine_am_today
+        if now_local < nine_am_today
+        else nine_am_today + dt.timedelta(days=1)
+    )
+
+    hours_until_9 = max(0.0, (nine_am - now_local).total_seconds() / 3600.0)
+    expected_consumption_until_9_kwh = (
+        hours_until_9 * avg_consumption_kwh_per_h * dishwasher_factor
+    )
+
+    # Minimum energy we should have NOW to still have reserve at 09:00
+    required_now_for_morning_kwh = expected_consumption_until_9_kwh + reserve_kwh
+    deficit_for_morning_reserve_kwh = max(
+        0.0, required_now_for_morning_kwh - current_battery_state
+    )
+
+    # --- Daytime load vs PV forecast ---
+    # PV forecast is not fully available to charge the battery, because a big part of it will be
+    # consumed by household load during the day (roughly 09:00–21:00).
+    daytime_load_kwh = 7.0
+
+    # Only PV beyond daytime load can be assumed to charge the battery (simplified model).
+    pv_available_for_battery_kwh = max(0.0, pv_kwh - daytime_load_kwh)
+
+    # Original goal: end of tomorrow = full battery (unless PV covers it)
     needed_to_full = max(0.0, capacity - current_battery_state)
-    deficit_after_pv = max(0.0, needed_to_full - pv_kwh)
+    deficit_after_pv_for_full_kwh = max(
+        0.0, needed_to_full - pv_available_for_battery_kwh
+    )
+
+    # Final grid charging requirement: at least cover morning reserve deficit, and (optionally)
+    # also cover deficit-to-full after PV forecast.
+    deficit_after_pv = max(
+        deficit_for_morning_reserve_kwh, deficit_after_pv_for_full_kwh
+    )
+
+    print(
+        f"Morning reserve target: {reserve_fraction * 100:.0f}% ({reserve_kwh:.2f} kWh). "
+        f"Hours until 09:00: {hours_until_9:.2f}h. "
+        f"Expected consumption until 09:00: {expected_consumption_until_9_kwh:.2f} kWh. "
+        f"Deficit for morning reserve: {deficit_for_morning_reserve_kwh:.2f} kWh."
+    )
 
     # Eligible slots by price cap
     eligible_by_price = [
@@ -595,7 +653,8 @@ def main() -> int:
 
     print("\n=== Decision ===")
     print(f"Needed to full now:          {needed_to_full:.2f} kWh")
-    print(f"Deficit after PV forecast:   {deficit_after_pv:.2f} kWh")
+    print(f"Deficit after PV forecast (full): {deficit_after_pv_for_full_kwh:.2f} kWh")
+    print(f"Grid charge needed (incl. morning reserve): {deficit_after_pv:.2f} kWh")
 
     if not chosen:
         print(
