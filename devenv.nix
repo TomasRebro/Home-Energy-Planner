@@ -26,6 +26,7 @@ in
   # https://devenv.sh/packages/
   packages = [
     pkgs.git
+    pkgs-unstable.sops
   ];
 
   # https://devenv.sh/languages/

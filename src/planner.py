@@ -277,15 +277,14 @@ def load_cnb_eur_czk_rate(cnb_url: str, for_date: dt.date) -> float:
     return float(prev.iloc[-1]["rate"])
 
 
-def load_ha_tomorrow_pv_kwh(ha_base_url: str, ha_token: str, entity_id: str) -> float:
+def load_ha_entity_state(ha_base_url: str, ha_token: str, entity_id: str) -> str:
     url = ha_base_url.rstrip("/") + f"/api/states/{entity_id}"
     headers = {"Authorization": f"Bearer {ha_token}", "Content-Type": "application/json"}
     r = requests.get(url, headers=headers, timeout=15)
     r.raise_for_status()
     data = r.json()
     state = data.get("state")
-    pv = float(state)
-    return pv
+    return state
 
 
 # -----------------------------
@@ -350,9 +349,9 @@ def main() -> int:
     ap.add_argument("--date", help="Date to plan for (YYYY-MM-DD) in Europe/Prague. Default: tomorrow.", default=None)
 
     ap.add_argument("--max-price-czk-per-mwh", type=float, default=2708.0, help="Do not charge above this price.")
-    ap.add_argument("--charge-power-kw", type=float, default=6.0)
+    ap.add_argument("--charge-power-kw", type=float, default=3.0)
     ap.add_argument("--battery-capacity-kwh", type=float, default=14.2)
-    ap.add_argument("--current-kwh", type=float, required=True, help="Current energy in battery (kWh).")
+    ap.add_argument("--current-battery-state-entity", default="sensor.battery_state_of_charge_capacity", help="HA entity id that returns current battery state of charge (kWh).")
 
     ap.add_argument("--pv-entity", default="sensor.energy_production_tomorrow",
                     help="HA entity id that returns tomorrow PV production (kWh).")
@@ -385,8 +384,10 @@ def main() -> int:
     #     return 2
 
     # Load inputs
-    # pv_kwh = load_ha_tomorrow_pv_kwh(args.ha_base_url, args.ha_token, args.pv_entity)
-    pv_kwh = 0.0
+    pv_kwh = float(load_ha_entity_state(args.ha_base_url, args.ha_token, args.pv_entity))
+    print(f"PV forecast tomorrow (HA): {pv_kwh:.2f} kWh")
+    current_battery_state = float(load_ha_entity_state(args.ha_base_url, args.ha_token, args.current_battery_state_entity))
+    print(f"Current battery state (HA): {current_battery_state:.2f} kWh")
     eur_czk = load_cnb_eur_czk_rate(cnb_url, plan_date)
     print(f"EUR→CZK rate used: {eur_czk:.4f}")
     ote_df = load_ote_15min_prices_eur_per_mwh(ote_url, tz=tz)
