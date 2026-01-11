@@ -15,8 +15,6 @@ Example:
 python planner.py \
   --ha-base-url http://homeassistant.local:8123 \
   --ha-token "YOUR_LONG_LIVED_TOKEN" \
-  --current-kwh 6.2 \
-  --charger-switch switch.battery_charger
 """
 
 from __future__ import annotations
@@ -25,6 +23,7 @@ import argparse
 import datetime as dt
 import math
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
@@ -37,10 +36,12 @@ import requests
 # Helpers
 # -----------------------------
 
+
 def prague_tz() -> dt.tzinfo:
     # Python 3.9+ supports zoneinfo
     try:
         from zoneinfo import ZoneInfo
+
         return ZoneInfo("Europe/Prague")
     except Exception:
         # Fallback: treat as local naive time
@@ -52,7 +53,9 @@ def parse_hhmm(s: str) -> dt.time:
     return dt.time(int(hh), int(mm))
 
 
-def daterange_window(date_local: dt.date, start: dt.time, end: dt.time, tz: dt.tzinfo) -> Tuple[dt.datetime, dt.datetime]:
+def daterange_window(
+    date_local: dt.date, start: dt.time, end: dt.time, tz: dt.tzinfo
+) -> Tuple[dt.datetime, dt.datetime]:
     """
     Returns [start_dt, end_dt) in local tz.
     If end < start (crosses midnight), end is on next day.
@@ -88,6 +91,7 @@ def http_get_bytes(url: str, timeout_s: int = 30) -> bytes:
 
 def read_excel_bytes(xlsx_bytes: bytes, **kwargs) -> pd.DataFrame:
     from io import BytesIO
+
     return pd.read_excel(BytesIO(xlsx_bytes), **kwargs)
 
 
@@ -104,110 +108,162 @@ def to_float(x) -> Optional[float]:
 # Data extraction
 # -----------------------------
 
+
 def load_ote_15min_prices_eur_per_mwh(ote_url: str, tz: dt.tzinfo) -> pd.DataFrame:
     """
+    Parse OTE 15-minute day-ahead XLSX in the format of DT_15MIN_.._CZ.xlsx.
+
+    Observed layout:
+      - A header row containing columns like:
+          Perioda | Časový interval | 15 min cena (EUR/MWh) | ...
+      - Data rows with time intervals like "00:00-00:15".
+
     Returns DataFrame with columns:
-      - start (timezone-aware datetime Europe/Prague)
+      - start (timezone-aware datetime in `tz`)
       - price_eur_per_mwh (float)
+
+    Notes:
+      - The date is inferred from the URL/filename (preferred) or from the sheet title.
+      - Rows without a Perioda are ignored.
     """
     xlsx = http_get_bytes(ote_url)
-    df = read_excel_bytes(xlsx)
 
-    # Heuristics: find a datetime/timestamp column + a numeric price column
-    # Common OTE patterns: columns like 'Datum', 'Čas', 'Cena (EUR/MWh)' etc.
-    cols = [c for c in df.columns]
+    # Read without headers first so we can locate the table header row reliably.
+    df0 = read_excel_bytes(xlsx, header=None)
 
-    # Find price column: first numeric-ish column that isn't obviously an index or hour
-    candidate_price_cols = []
-    for c in cols:
-        s = str(c).lower()
-        if "eur" in s and ("mwh" in s or "mw" in s or "m" in s) and ("cen" in s or "price" in s):
-            candidate_price_cols.append(c)
-    if not candidate_price_cols:
-        # fallback: pick the last numeric column
-        numeric_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
-        if not numeric_cols:
-            raise RuntimeError("Could not find a numeric price column in OTE XLSX.")
-        price_col = numeric_cols[-1]
-    else:
-        price_col = candidate_price_cols[0]
-
-    # Find time columns
-    # Try: a single datetime column
-    datetime_col = None
-    for c in cols:
-        if pd.api.types.is_datetime64_any_dtype(df[c]):
-            datetime_col = c
+    # Find the header row that contains both "Časový interval" and "15 min cena".
+    header_row_idx = None
+    for i in range(min(100, len(df0))):
+        row_vals = [
+            str(v).strip().lower() for v in df0.iloc[i].tolist() if not pd.isna(v)
+        ]
+        has_interval = any(
+            ("časový interval" in v)
+            or ("casový interval" in v)
+            or ("casovy interval" in v)
+            or ("time interval" in v)
+            for v in row_vals
+        )
+        has_15min_price = any(
+            ("15 min cena" in v)
+            or ("15min cena" in v)
+            or (("15 min" in v) and ("cena" in v))
+            or (("15min" in v) and ("cena" in v))
+            for v in row_vals
+        )
+        if has_interval and has_15min_price:
+            header_row_idx = i
             break
 
-    if datetime_col is not None:
-        starts = pd.to_datetime(df[datetime_col], errors="coerce")
-    else:
-        # Try separate date + time columns
-        date_col = None
-        time_col = None
-        for c in cols:
-            s = str(c).lower()
-            if date_col is None and ("datum" in s or "date" in s):
-                date_col = c
-            if time_col is None and ("čas" in s or "cas" in s or "time" in s or "hod" in s):
-                time_col = c
+    if header_row_idx is None:
+        raise RuntimeError(
+            "Could not find OTE table header row (expected columns like 'Časový interval' and '15 min cena')."
+        )
 
-        if date_col is None or time_col is None:
-            # Fallback: maybe first two columns are date/time
-            if len(cols) >= 2:
-                date_col, time_col = cols[0], cols[1]
-            else:
-                raise RuntimeError("Could not find date/time columns in OTE XLSX.")
+    # Re-read using that row as the header.
+    df = read_excel_bytes(xlsx, header=header_row_idx)
 
-        dates = pd.to_datetime(df[date_col], errors="coerce").dt.date
-        # time might be datetime, timedelta, string, or number
-        time_raw = df[time_col]
+    # Normalize/locate required columns.
+    cols = {str(c).strip().lower(): c for c in df.columns}
 
-        def parse_time(v) -> Optional[dt.time]:
-            if pd.isna(v):
-                return None
-            if isinstance(v, dt.time):
-                return v
-            if isinstance(v, dt.datetime):
-                return v.time()
-            if isinstance(v, (pd.Timestamp,)):
-                return v.to_pydatetime().time()
-            if isinstance(v, dt.timedelta):
-                secs = int(v.total_seconds())
-                return (dt.datetime.min + dt.timedelta(seconds=secs)).time()
-            # Excel time can come as float fraction of day
-            fv = to_float(v)
-            if fv is not None and 0 <= fv < 1.1:
-                secs = int(round(fv * 24 * 3600))
-                return (dt.datetime.min + dt.timedelta(seconds=secs)).time()
-            # string "HH:MM"
-            try:
-                s = str(v).strip()
-                if ":" in s:
-                    hh, mm = s.split(":")[:2]
-                    return dt.time(int(hh), int(mm))
-            except Exception:
-                return None
+    # Period column: 'Perioda' (sometimes 'Period')
+    period_col = None
+    for k, orig in cols.items():
+        if k == "perioda" or "period" in k:
+            period_col = orig
+            break
+
+    # Time interval column: 'Časový interval'
+    time_col = None
+    for k, orig in cols.items():
+        if (
+            "časový interval" in k
+            or "casový interval" in k
+            or "casovy interval" in k
+            or "time interval" in k
+        ):
+            time_col = orig
+            break
+
+    # 15-min price column: typically "15 min cena\n(EUR/MWh)"
+    price_col = None
+    for k, orig in cols.items():
+        if ("15 min" in k) and ("cena" in k) and ("eur/mwh" in k):
+            price_col = orig
+            break
+
+    if period_col is None or time_col is None or price_col is None:
+        raise RuntimeError(
+            f"OTE XLSX columns not recognized. Found columns: {list(df.columns)}"
+        )
+
+    # Infer the market day date from URL (DT_15MIN_dd_mm_yyyy) or from the title cell.
+    def infer_date_from_url(url: str) -> Optional[dt.date]:
+        m = re.search(r"DT_15MIN_(\d{2})_(\d{2})_(\d{4})", url)
+        if m:
+            dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
+            return dt.date(int(yyyy), int(mm), int(dd))
+        m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", url)
+        if m:
+            dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
+            return dt.date(int(yyyy), int(mm), int(dd))
+        return None
+
+    def infer_date_from_sheet() -> Optional[dt.date]:
+        # Look for something like "SPOT MARKET INDEX - 05.01.2026" in the first ~30 rows / first few cols
+        for i in range(min(30, len(df0))):
+            for j in range(min(6, df0.shape[1])):
+                v = df0.iat[i, j]
+                if pd.isna(v):
+                    continue
+                s = str(v)
+                m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", s)
+                if m:
+                    dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
+                    return dt.date(int(yyyy), int(mm), int(dd))
+        return None
+
+    market_date = infer_date_from_url(ote_url) or infer_date_from_sheet()
+    if market_date is None:
+        raise RuntimeError(
+            "Could not infer market date from OTE URL/filename or sheet title."
+        )
+
+    # Keep only rows with a valid Perioda.
+    df = df.dropna(subset=[period_col]).copy()
+
+    # Parse time interval like "00:00-00:15" -> start time
+    def parse_interval_start(v) -> Optional[dt.time]:
+        if pd.isna(v):
             return None
+        s = str(v).strip()
+        m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", s)
+        if not m:
+            return None
+        hh, mm = int(m.group(1)), int(m.group(2))
+        return dt.time(hh, mm)
 
-        times = time_raw.map(parse_time)
-        starts = [
-            dt.datetime.combine(d, t, tzinfo=tz) if (d is not None and t is not None) else pd.NaT
-            for d, t in zip(dates, times)
-        ]
-        starts = pd.to_datetime(starts, errors="coerce")
+    starts_t = df[time_col].map(parse_interval_start)
+    starts_dt = [
+        dt.datetime.combine(market_date, t, tzinfo=tz) if t is not None else pd.NaT
+        for t in starts_t
+    ]
 
     prices = pd.to_numeric(df[price_col], errors="coerce")
 
-    out = pd.DataFrame({"start": starts, "price_eur_per_mwh": prices}).dropna()
+    out = pd.DataFrame(
+        {
+            "start": pd.to_datetime(starts_dt, errors="coerce"),
+            "price_eur_per_mwh": prices,
+        }
+    ).dropna()
+
     out = out.sort_values("start").reset_index(drop=True)
 
-    # Keep only exact 15-min aligned entries (best-effort)
-    out = out[out["start"].dt.minute.isin([0, 15, 30, 45])]
-
     if out.empty:
-        raise RuntimeError("OTE price table parsed, but produced 0 usable rows (check XLSX layout/headers).")
+        raise RuntimeError(
+            "OTE price table parsed, but produced 0 usable rows (check XLSX layout/headers)."
+        )
 
     return out
 
@@ -230,8 +286,14 @@ def load_cnb_eur_czk_rate(cnb_url: str, for_date: dt.date) -> float:
     # Find the header row containing "Den" and "Kurz" and "Měna"
     header_row_idx = None
     for i in range(min(50, len(df))):
-        row_vals = [str(v).strip().lower() for v in df.iloc[i].tolist() if not pd.isna(v)]
-        if ("den" in row_vals) and ("kurz" in row_vals) and (("měna" in row_vals) or ("mena" in row_vals)):
+        row_vals = [
+            str(v).strip().lower() for v in df.iloc[i].tolist() if not pd.isna(v)
+        ]
+        if (
+            ("den" in row_vals)
+            and ("kurz" in row_vals)
+            and (("měna" in row_vals) or ("mena" in row_vals))
+        ):
             header_row_idx = i
             break
 
@@ -279,7 +341,10 @@ def load_cnb_eur_czk_rate(cnb_url: str, for_date: dt.date) -> float:
 
 def load_ha_entity_state(ha_base_url: str, ha_token: str, entity_id: str) -> str:
     url = ha_base_url.rstrip("/") + f"/api/states/{entity_id}"
-    headers = {"Authorization": f"Bearer {ha_token}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {ha_token}",
+        "Content-Type": "application/json",
+    }
     r = requests.get(url, headers=headers, timeout=15)
     r.raise_for_status()
     data = r.json()
@@ -290,6 +355,7 @@ def load_ha_entity_state(ha_base_url: str, ha_token: str, entity_id: str) -> str
 # -----------------------------
 # Planning
 # -----------------------------
+
 
 @dataclass(frozen=True)
 class Slot:
@@ -327,9 +393,13 @@ def merge_contiguous_slots(chosen: List[Slot]) -> List[Slot]:
     merged: List[Slot] = []
     cur = chosen[0]
     for s in chosen[1:]:
-        if s.start == cur.end and math.isclose(s.price_czk_per_mwh, cur.price_czk_per_mwh, rel_tol=0, abs_tol=1e-9):
+        if s.start == cur.end and math.isclose(
+            s.price_czk_per_mwh, cur.price_czk_per_mwh, rel_tol=0, abs_tol=1e-9
+        ):
             # same price and contiguous -> merge
-            cur = Slot(start=cur.start, end=s.end, price_czk_per_mwh=cur.price_czk_per_mwh)
+            cur = Slot(
+                start=cur.start, end=s.end, price_czk_per_mwh=cur.price_czk_per_mwh
+            )
         elif s.start == cur.end:
             # contiguous but different price: still merge time-wise is OK for a real charger,
             # but keep prices separate for transparency -> do NOT merge.
@@ -345,29 +415,77 @@ def merge_contiguous_slots(chosen: List[Slot]) -> List[Slot]:
 def main() -> int:
     tz = prague_tz()
 
-    ap = argparse.ArgumentParser(description="Plan overnight battery charging from OTE 15-min spot prices.")
-    ap.add_argument("--date", help="Date to plan for (YYYY-MM-DD) in Europe/Prague. Default: tomorrow.", default=None)
+    ap = argparse.ArgumentParser(
+        description="Plan overnight battery charging from OTE 15-min spot prices."
+    )
+    ap.add_argument(
+        "--date",
+        help="Date to plan for (YYYY-MM-DD) in Europe/Prague. Default: tomorrow.",
+        default=None,
+    )
 
-    ap.add_argument("--max-price-czk-per-mwh", type=float, default=2708.0, help="Do not charge above this price.")
+    ap.add_argument(
+        "--max-price-czk-per-mwh",
+        type=float,
+        default=2708.0,
+        help="Do not charge above this price.",
+    )
     ap.add_argument("--charge-power-kw", type=float, default=3.0)
     ap.add_argument("--battery-capacity-kwh", type=float, default=14.2)
-    ap.add_argument("--current-battery-state-entity", default="sensor.battery_state_of_charge_capacity", help="HA entity id that returns current battery state of charge (kWh).")
+    ap.add_argument(
+        "--current-battery-state-entity",
+        default="sensor.battery_state_of_charge_capacity",
+        help="HA entity id that returns current battery state of charge (kWh).",
+    )
 
-    ap.add_argument("--pv-entity", default="sensor.energy_production_tomorrow",
-                    help="HA entity id that returns tomorrow PV production (kWh).")
-    ap.add_argument("--ha-base-url", default=os.getenv("HA_BASE_URL", ""), help="Home Assistant base URL.")
-    ap.add_argument("--ha-token", default=os.getenv("HA_TOKEN", ""), help="Home Assistant long-lived token.")
+    ap.add_argument(
+        "--pv-entity",
+        default="sensor.energy_production_tomorrow",
+        help="HA entity id that returns tomorrow PV production (kWh).",
+    )
+    ap.add_argument(
+        "--ha-base-url",
+        default=os.getenv("HA_BASE_URL", ""),
+        help="Home Assistant base URL.",
+    )
+    ap.add_argument(
+        "--ha-token",
+        default=os.getenv("HA_TOKEN", ""),
+        help="Home Assistant long-lived token.",
+    )
 
-    ap.add_argument("--window-start", default="00:00", help="Eligible charging window start (HH:MM) local time.")
-    ap.add_argument("--window-end", default="06:00", help="Eligible charging window end (HH:MM) local time.")
-    ap.add_argument("--prefer-window", action="store_true",
-                    help="If set, ONLY charge inside window. Otherwise you can spill outside window if needed.")
+    ap.add_argument(
+        "--window-start",
+        default="00:00",
+        help="Eligible charging window start (HH:MM) local time.",
+    )
+    ap.add_argument(
+        "--window-end",
+        default="06:00",
+        help="Eligible charging window end (HH:MM) local time.",
+    )
+    ap.add_argument(
+        "--prefer-window",
+        action="store_true",
+        help="If set, ONLY charge inside window. Otherwise you can spill outside window if needed.",
+    )
 
-    ap.add_argument("--ote-url", default=None, help="Override OTE URL. If omitted, generated from --date.")
-    ap.add_argument("--cnb-url", default=None, help="Override CNB URL. If omitted, generated from --date.")
+    ap.add_argument(
+        "--ote-url",
+        default=None,
+        help="Override OTE URL. If omitted, generated from --date.",
+    )
+    ap.add_argument(
+        "--cnb-url",
+        default=None,
+        help="Override CNB URL. If omitted, generated from --date.",
+    )
 
-    ap.add_argument("--charger-switch", default=None,
-                    help="If provided, print Home Assistant service calls for this switch entity_id.")
+    ap.add_argument(
+        "--charger-switch",
+        default=None,
+        help="If provided, print Home Assistant service calls for this switch entity_id.",
+    )
     args = ap.parse_args()
 
     now = dt.datetime.now(tz)
@@ -379,14 +497,23 @@ def main() -> int:
     ote_url = args.ote_url or build_ote_url(plan_date)
     cnb_url = args.cnb_url or build_cnb_url(plan_date)
 
-    # if not args.ha_base_url or not args.ha_token:
-    #     print("ERROR: Provide --ha-base-url and --ha-token (or env HA_BASE_URL / HA_TOKEN).", file=sys.stderr)
-    #     return 2
+    if not args.ha_base_url or not args.ha_token:
+        print(
+            "ERROR: Provide --ha-base-url and --ha-token (or env HA_BASE_URL / HA_TOKEN).",
+            file=sys.stderr,
+        )
+        return 2
 
     # Load inputs
-    pv_kwh = float(load_ha_entity_state(args.ha_base_url, args.ha_token, args.pv_entity))
+    pv_kwh = float(
+        load_ha_entity_state(args.ha_base_url, args.ha_token, args.pv_entity)
+    )
     print(f"PV forecast tomorrow (HA): {pv_kwh:.2f} kWh")
-    current_battery_state = float(load_ha_entity_state(args.ha_base_url, args.ha_token, args.current_battery_state_entity))
+    current_battery_state = float(
+        load_ha_entity_state(
+            args.ha_base_url, args.ha_token, args.current_battery_state_entity
+        )
+    )
     print(f"Current battery state (HA): {current_battery_state:.2f} kWh")
     eur_czk = load_cnb_eur_czk_rate(cnb_url, plan_date)
     print(f"EUR→CZK rate used: {eur_czk:.4f}")
@@ -405,23 +532,25 @@ def main() -> int:
 
     # Determine how much grid energy is needed (default goal: end of tomorrow = full battery)
     capacity = args.battery_capacity_kwh
-    current = args.current_kwh
-    if current < 0 or current > capacity * 1.05:
-        print(f"ERROR: --current-kwh looks invalid vs capacity ({current} vs {capacity}).", file=sys.stderr)
-        return 2
 
-    needed_to_full = max(0.0, capacity - current)
+    needed_to_full = max(0.0, capacity - current_battery_state)
     deficit_after_pv = max(0.0, needed_to_full - pv_kwh)
 
     # Eligible slots by price cap
-    eligible_by_price = [s for s in slots_all if s.price_czk_per_mwh <= args.max_price_czk_per_mwh]
+    eligible_by_price = [
+        s for s in slots_all if s.price_czk_per_mwh <= args.max_price_czk_per_mwh
+    ]
 
     # Window filter
     wstart = parse_hhmm(args.window_start)
     wend = parse_hhmm(args.window_end)
     win_start_dt, win_end_dt = daterange_window(plan_date, wstart, wend, tz)
 
-    in_window = [s for s in eligible_by_price if (s.start >= win_start_dt and s.end <= win_end_dt)]
+    in_window = [
+        s
+        for s in eligible_by_price
+        if (s.start >= win_start_dt and s.end <= win_end_dt)
+    ]
     out_window = [s for s in eligible_by_price if s not in in_window]
 
     # Choose charging slots
@@ -454,43 +583,61 @@ def main() -> int:
     print(f"CNB URL:                     {cnb_url}")
     print(f"EUR→CZK rate used:           {eur_czk:.4f}")
     print(f"Battery capacity:            {capacity:.2f} kWh")
-    print(f"Current battery energy:      {current:.2f} kWh")
+    print(f"Current battery energy:      {current_battery_state:.2f} kWh")
     print(f"Forecast PV tomorrow (HA):   {pv_kwh:.2f} kWh")
     print(f"Charge power:                {args.charge_power_kw:.2f} kW")
-    print(f"Max price:                   {args.max_price_czk_per_mwh:.2f} CZK/MWh ({args.max_price_czk_per_mwh/1000:.4f} CZK/kWh)")
-    print(f"Eligible window:             {win_start_dt:%Y-%m-%d %H:%M} → {win_end_dt:%Y-%m-%d %H:%M} ({'ONLY' if args.prefer_window else 'preferred'})")
+    print(
+        f"Max price:                   {args.max_price_czk_per_mwh:.2f} CZK/MWh ({args.max_price_czk_per_mwh / 1000:.4f} CZK/kWh)"
+    )
+    print(
+        f"Eligible window:             {win_start_dt:%Y-%m-%d %H:%M} → {win_end_dt:%Y-%m-%d %H:%M} ({'ONLY' if args.prefer_window else 'preferred'})"
+    )
 
     print("\n=== Decision ===")
     print(f"Needed to full now:          {needed_to_full:.2f} kWh")
     print(f"Deficit after PV forecast:   {deficit_after_pv:.2f} kWh")
 
     if not chosen:
-        print("\n✅ No grid charging needed (PV forecast should cover filling the battery).")
+        print(
+            "\n✅ No grid charging needed (PV forecast should cover filling the battery)."
+        )
         return 0
 
     kwh_per_slot = args.charge_power_kw * 0.25
     planned_kwh = len(chosen) * kwh_per_slot
 
     # weighted average price
-    avg_price_czk_per_mwh = sum(s.price_czk_per_mwh for s in chosen) / max(1, len(chosen))
+    avg_price_czk_per_mwh = sum(s.price_czk_per_mwh for s in chosen) / max(
+        1, len(chosen)
+    )
 
     print("\n⚡ Planned grid charging slots (15 min):")
     for s in chosen:
-        print(f"- {s.start:%Y-%m-%d %H:%M} → {s.end:%H:%M}  |  {s.price_czk_per_mwh:8.2f} CZK/MWh  ({s.price_czk_per_kwh:.4f} CZK/kWh)")
+        print(
+            f"- {s.start:%Y-%m-%d %H:%M} → {s.end:%H:%M}  |  {s.price_czk_per_mwh:8.2f} CZK/MWh  ({s.price_czk_per_kwh:.4f} CZK/kWh)"
+        )
 
     print("\n📌 Merged intervals (easier to execute):")
     for s in chosen_merged:
-        print(f"- {s.start:%Y-%m-%d %H:%M} → {s.end:%Y-%m-%d %H:%M}  |  {s.price_czk_per_mwh:8.2f} CZK/MWh")
+        print(
+            f"- {s.start:%Y-%m-%d %H:%M} → {s.end:%Y-%m-%d %H:%M}  |  {s.price_czk_per_mwh:8.2f} CZK/MWh"
+        )
 
     print("\n=== Summary ===")
-    print(f"Slots selected:              {len(chosen)} (≈ {planned_kwh:.2f} kWh at {kwh_per_slot:.2f} kWh/slot)")
-    print(f"Average selected price:      {avg_price_czk_per_mwh:.2f} CZK/MWh ({avg_price_czk_per_mwh/1000:.4f} CZK/kWh)")
+    print(
+        f"Slots selected:              {len(chosen)} (≈ {planned_kwh:.2f} kWh at {kwh_per_slot:.2f} kWh/slot)"
+    )
+    print(
+        f"Average selected price:      {avg_price_czk_per_mwh:.2f} CZK/MWh ({avg_price_czk_per_mwh / 1000:.4f} CZK/kWh)"
+    )
 
     # Optional: print HA service calls (you still need an automation/scheduler to run them at times)
     if args.charger_switch:
         print("\n=== Home Assistant service call snippets ===")
         print("# Turn ON at each interval start, OFF at each interval end.")
-        print("# You can paste these into HA scripts or use an external scheduler (cron) calling HA REST API.")
+        print(
+            "# You can paste these into HA scripts or use an external scheduler (cron) calling HA REST API."
+        )
         print("# curl examples:")
         for s in chosen_merged:
             on_time = s.start.strftime("%Y-%m-%d %H:%M:%S")
@@ -499,12 +646,12 @@ def main() -> int:
             print(
                 f"curl -s -X POST '{args.ha_base_url.rstrip('/')}/api/services/switch/turn_on' "
                 f"-H 'Authorization: Bearer {args.ha_token}' -H 'Content-Type: application/json' "
-                f"-d '{{\"entity_id\":\"{args.charger_switch}\"}}'"
+                f'-d \'{{"entity_id":"{args.charger_switch}"}}\''
             )
             print(
                 f"curl -s -X POST '{args.ha_base_url.rstrip('/')}/api/services/switch/turn_off' "
                 f"-H 'Authorization: Bearer {args.ha_token}' -H 'Content-Type: application/json' "
-                f"-d '{{\"entity_id\":\"{args.charger_switch}\"}}'"
+                f'-d \'{{"entity_id":"{args.charger_switch}"}}\''
             )
 
     return 0
