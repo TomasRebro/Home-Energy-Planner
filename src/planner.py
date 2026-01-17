@@ -19,14 +19,12 @@ python planner.py \
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import math
 import os
 import re
-import sys
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -83,8 +81,28 @@ def build_cnb_url(for_date: dt.date) -> str:
     return f"https://www.ote-cr.cz/pubweb/attachments/{for_date:%m}/{for_date:%Y}/Kurzovni_listek_CNB_{for_date:%Y}.xlsx"
 
 
-def http_get_bytes(url: str, timeout_s: int = 30) -> bytes:
-    r = requests.get(url, timeout=timeout_s)
+def get_bytes(url_or_path: str, timeout_s: int = 30) -> bytes:
+    """Read bytes from either an http(s) URL or a local file path.
+
+    Supports:
+      - https://... / http://...
+      - file:///absolute/path
+      - relative/or/absolute filesystem paths
+    """
+    s = (url_or_path or "").strip()
+    if not s:
+        raise ValueError("Empty url_or_path")
+
+    if s.startswith("file://"):
+        path = s[len("file://") :]
+        with open(path, "rb") as f:
+            return f.read()
+
+    if os.path.exists(s):
+        with open(s, "rb") as f:
+            return f.read()
+
+    r = requests.get(s, timeout=timeout_s)
     r.raise_for_status()
     return r.content
 
@@ -111,7 +129,7 @@ def to_float(x) -> Optional[float]:
 
 def load_ote_15min_prices_eur_per_mwh(ote_url: str, tz: dt.tzinfo) -> pd.DataFrame:
     """
-    Parse OTE 15-minute day-ahead XLSX in the format of DT_15MIN_.._CZ.xlsx.
+    Parse OTE 15-minute day-ahead XLSX in the format of DT_15MIN_.._CZ.xlsx (URL or local file path).
 
     Observed layout:
       - A header row containing columns like:
@@ -126,7 +144,7 @@ def load_ote_15min_prices_eur_per_mwh(ote_url: str, tz: dt.tzinfo) -> pd.DataFra
       - The date is inferred from the URL/filename (preferred) or from the sheet title.
       - Rows without a Perioda are ignored.
     """
-    xlsx = http_get_bytes(ote_url)
+    xlsx = get_bytes(ote_url)
 
     # Read without headers first so we can locate the table header row reliably.
     df0 = read_excel_bytes(xlsx, header=None)
@@ -278,7 +296,7 @@ def load_cnb_eur_czk_rate(cnb_url: str, for_date: dt.date) -> float:
 
     Returns EUR→CZK for the given date, or nearest previous date if missing.
     """
-    xlsx = http_get_bytes(cnb_url)
+    xlsx = get_bytes(cnb_url)
 
     # Read without assuming header row; we'll find the header by content
     df = read_excel_bytes(xlsx, header=None)
@@ -354,6 +372,189 @@ def load_ha_entity_state(ha_base_url: str, ha_token: str, entity_id: str) -> str
 
 
 # -----------------------------
+# Testable planning inputs / outputs
+# -----------------------------
+
+
+@dataclass(frozen=True)
+class PlanningInputs:
+    plan_date: dt.date
+    eur_czk: float
+    pv_kwh: float
+    current_battery_state_kwh: float
+    battery_capacity_kwh: float
+    charge_power_kw: float
+    max_price_czk_per_mwh: float
+    window_start: dt.time
+    window_end: dt.time
+    prefer_window: bool
+
+    # Policy knobs (same defaults as before)
+    reserve_fraction: float = 0.10
+    avg_consumption_kwh_per_h: float = 0.300
+    dishwasher_factor: float = 1.10
+    daytime_load_kwh: float = 7.0
+
+
+@dataclass(frozen=True)
+class PlanningDecision:
+    needed_to_full_kwh: float
+    deficit_after_pv_for_full_kwh: float
+    deficit_for_morning_reserve_kwh: float
+    grid_charge_needed_kwh: float
+    hours_until_9: float
+    expected_consumption_until_9_kwh: float
+
+
+@dataclass(frozen=True)
+class PlanningResult:
+    inputs: PlanningInputs
+    decision: PlanningDecision
+    chosen_slots: List["Slot"]
+    merged_slots: List["Slot"]
+
+
+def compute_decision(
+    inputs: PlanningInputs, tz: dt.tzinfo, now_local: Optional[dt.datetime] = None
+) -> PlanningDecision:
+    """Compute how much energy must be charged from grid.
+
+    Pure/testable: pass a fixed `now_local` in tests for deterministic results.
+    """
+    now_local = now_local or dt.datetime.now(tz)
+
+    capacity = inputs.battery_capacity_kwh
+    reserve_kwh = capacity * inputs.reserve_fraction
+
+    nine_am_today = dt.datetime.combine(now_local.date(), dt.time(9, 0), tzinfo=tz)
+    nine_am = (
+        nine_am_today
+        if now_local < nine_am_today
+        else nine_am_today + dt.timedelta(days=1)
+    )
+
+    hours_until_9 = max(0.0, (nine_am - now_local).total_seconds() / 3600.0)
+    expected_consumption_until_9_kwh = (
+        hours_until_9 * inputs.avg_consumption_kwh_per_h * inputs.dishwasher_factor
+    )
+
+    required_now_for_morning_kwh = expected_consumption_until_9_kwh + reserve_kwh
+    deficit_for_morning_reserve_kwh = max(
+        0.0, required_now_for_morning_kwh - inputs.current_battery_state_kwh
+    )
+
+    pv_available_for_battery_kwh = max(0.0, inputs.pv_kwh - inputs.daytime_load_kwh)
+
+    needed_to_full_kwh = max(0.0, capacity - inputs.current_battery_state_kwh)
+    deficit_after_pv_for_full_kwh = max(
+        0.0, needed_to_full_kwh - pv_available_for_battery_kwh
+    )
+
+    grid_charge_needed_kwh = max(
+        deficit_for_morning_reserve_kwh, deficit_after_pv_for_full_kwh
+    )
+
+    return PlanningDecision(
+        needed_to_full_kwh=needed_to_full_kwh,
+        deficit_after_pv_for_full_kwh=deficit_after_pv_for_full_kwh,
+        deficit_for_morning_reserve_kwh=deficit_for_morning_reserve_kwh,
+        grid_charge_needed_kwh=grid_charge_needed_kwh,
+        hours_until_9=hours_until_9,
+        expected_consumption_until_9_kwh=expected_consumption_until_9_kwh,
+    )
+
+
+def build_slots_from_ote_df(
+    ote_df: pd.DataFrame, tz: dt.tzinfo, eur_czk: float
+) -> List["Slot"]:
+    """Convert OTE dataframe (start, price_eur_per_mwh) into Slot list in CZK/MWh."""
+    df = ote_df.copy()
+    df["price_czk_per_mwh"] = df["price_eur_per_mwh"] * eur_czk
+
+    slots: List[Slot] = []
+    for _, row in df.iterrows():
+        start = row["start"].to_pydatetime()
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=tz)
+        end = start + dt.timedelta(minutes=15)
+        p = float(row["price_czk_per_mwh"])
+        slots.append(Slot(start=start, end=end, price_czk_per_mwh=p))
+    return slots
+
+
+def plan_charging(
+    ote_df: pd.DataFrame,
+    inputs: PlanningInputs,
+    tz: dt.tzinfo,
+    now_local: Optional[dt.datetime] = None,
+) -> PlanningResult:
+    """Pure planning function: prices + inputs -> selected slots."""
+    decision = compute_decision(inputs, tz=tz, now_local=now_local)
+
+    slots_all = build_slots_from_ote_df(ote_df, tz=tz, eur_czk=inputs.eur_czk)
+
+    eligible_by_price = [
+        s for s in slots_all if s.price_czk_per_mwh <= inputs.max_price_czk_per_mwh
+    ]
+
+    win_start_dt, win_end_dt = daterange_window(
+        inputs.plan_date, inputs.window_start, inputs.window_end, tz
+    )
+
+    in_window = [
+        s
+        for s in eligible_by_price
+        if (s.start >= win_start_dt and s.end <= win_end_dt)
+    ]
+    out_window = [s for s in eligible_by_price if s not in in_window]
+
+    if decision.grid_charge_needed_kwh <= 0:
+        chosen: List[Slot] = []
+    else:
+        chosen = pick_cheapest_slots(
+            in_window, decision.grid_charge_needed_kwh, inputs.charge_power_kw
+        )
+
+        if not inputs.prefer_window:
+            kwh_per_slot = inputs.charge_power_kw * 0.25
+            have_kwh = len(chosen) * kwh_per_slot
+            remaining = max(0.0, decision.grid_charge_needed_kwh - have_kwh)
+            if remaining > 1e-9:
+                extra = pick_cheapest_slots(
+                    out_window, remaining, inputs.charge_power_kw
+                )
+                chosen = sorted(chosen + extra, key=lambda s: s.start)
+
+    merged = merge_contiguous_slots(chosen)
+    return PlanningResult(
+        inputs=inputs, decision=decision, chosen_slots=chosen, merged_slots=merged
+    )
+
+
+def load_inputs_file(path: str, default_plan_date: dt.date) -> Dict[str, Any]:
+    """Load a local JSON inputs file for test runs."""
+    import json
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError("inputs file must contain a JSON object")
+
+    if "plan_date" in data and isinstance(data["plan_date"], str):
+        data["plan_date"] = dt.date.fromisoformat(data["plan_date"])
+    else:
+        data.setdefault("plan_date", default_plan_date)
+
+    if "window_start" in data and isinstance(data["window_start"], str):
+        data["window_start"] = parse_hhmm(data["window_start"])
+    if "window_end" in data and isinstance(data["window_end"], str):
+        data["window_end"] = parse_hhmm(data["window_end"])
+
+    return data
+
+
+# -----------------------------
 # Planning
 # -----------------------------
 
@@ -411,310 +612,3 @@ def merge_contiguous_slots(chosen: List[Slot]) -> List[Slot]:
             cur = s
     merged.append(cur)
     return merged
-
-
-def main() -> int:
-    tz = prague_tz()
-
-    ap = argparse.ArgumentParser(
-        description="Plan overnight battery charging from OTE 15-min spot prices."
-    )
-    ap.add_argument(
-        "--date",
-        help="Date to plan for (YYYY-MM-DD) in Europe/Prague. Default: tomorrow.",
-        default=None,
-    )
-
-    ap.add_argument(
-        "--max-price-czk-per-mwh",
-        type=float,
-        default=2708.0,
-        help="Do not charge above this price.",
-    )
-    ap.add_argument("--charge-power-kw", type=float, default=3.0)
-    ap.add_argument("--battery-capacity-kwh", type=float, default=14.2)
-    ap.add_argument(
-        "--current-battery-state-entity",
-        default="sensor.battery_state_of_charge_capacity",
-        help="HA entity id that returns current battery state of charge (kWh).",
-    )
-
-    ap.add_argument(
-        "--pv-entity",
-        default="sensor.energy_production_tomorrow",
-        help="HA entity id that returns tomorrow PV production (kWh).",
-    )
-    ap.add_argument(
-        "--ha-base-url",
-        default=os.getenv("HA_BASE_URL", ""),
-        help="Home Assistant base URL.",
-    )
-    ap.add_argument(
-        "--ha-token",
-        default=os.getenv("HA_TOKEN", ""),
-        help="Home Assistant long-lived token.",
-    )
-
-    ap.add_argument(
-        "--window-start",
-        default="00:00",
-        help="Eligible charging window start (HH:MM) local time.",
-    )
-    ap.add_argument(
-        "--window-end",
-        default="06:00",
-        help="Eligible charging window end (HH:MM) local time.",
-    )
-    ap.add_argument(
-        "--prefer-window",
-        action="store_true",
-        help="If set, ONLY charge inside window. Otherwise you can spill outside window if needed.",
-    )
-
-    ap.add_argument(
-        "--ote-url",
-        default=None,
-        help="Override OTE URL. If omitted, generated from --date.",
-    )
-    ap.add_argument(
-        "--cnb-url",
-        default=None,
-        help="Override CNB URL. If omitted, generated from --date.",
-    )
-
-    ap.add_argument(
-        "--charger-switch",
-        default=None,
-        help="If provided, print Home Assistant service calls for this switch entity_id.",
-    )
-    args = ap.parse_args()
-
-    now = dt.datetime.now(tz)
-    if args.date:
-        plan_date = dt.date.fromisoformat(args.date)
-    else:
-        plan_date = (now + dt.timedelta(days=1)).date()
-
-    ote_url = args.ote_url or build_ote_url(plan_date)
-    cnb_url = args.cnb_url or build_cnb_url(
-        now.date()
-    )  # Use today's rate for planning, because CNB rates are updated daily
-
-    if not args.ha_base_url or not args.ha_token:
-        print(
-            "ERROR: Provide --ha-base-url and --ha-token (or env HA_BASE_URL / HA_TOKEN).",
-            file=sys.stderr,
-        )
-        return 2
-
-    # Load inputs
-    pv_kwh = float(
-        load_ha_entity_state(args.ha_base_url, args.ha_token, args.pv_entity)
-    )
-    print(f"PV forecast tomorrow (HA): {pv_kwh:.2f} kWh")
-    current_battery_state = float(
-        load_ha_entity_state(
-            args.ha_base_url, args.ha_token, args.current_battery_state_entity
-        )
-    )
-    print(f"Current battery state (HA): {current_battery_state:.2f} kWh")
-    eur_czk = load_cnb_eur_czk_rate(cnb_url, plan_date)
-    print(f"EUR→CZK rate used: {eur_czk:.4f}")
-    ote_df = load_ote_15min_prices_eur_per_mwh(ote_url, tz=tz)
-
-    # Convert OTE prices to CZK/MWh
-    ote_df["price_czk_per_mwh"] = ote_df["price_eur_per_mwh"] * eur_czk
-
-    # Build slot list
-    slots_all: List[Slot] = []
-    for _, row in ote_df.iterrows():
-        start = row["start"].to_pydatetime()
-        end = start + dt.timedelta(minutes=15)
-        p = float(row["price_czk_per_mwh"])
-        slots_all.append(Slot(start=start, end=end, price_czk_per_mwh=p))
-
-    # Determine how much grid energy is needed (default goal: end of tomorrow = full battery)
-    capacity = args.battery_capacity_kwh
-
-    # --- Morning reserve logic ---
-    # We want to ensure there is enough energy to cover consumption until 09:00 and still have
-    # at least 10% of battery left as a reserve.
-    reserve_fraction = 0.10
-    reserve_kwh = capacity * reserve_fraction
-
-    # Average consumption: 300 Wh/h + 10% (dishwasher factor)
-    avg_consumption_kwh_per_h = 0.300
-    dishwasher_factor = 1.10
-
-    now_local = dt.datetime.now(tz)
-
-    # Next occurrence of 09:00 local time
-    nine_am_today = dt.datetime.combine(now_local.date(), dt.time(9, 0), tzinfo=tz)
-    nine_am = (
-        nine_am_today
-        if now_local < nine_am_today
-        else nine_am_today + dt.timedelta(days=1)
-    )
-
-    hours_until_9 = max(0.0, (nine_am - now_local).total_seconds() / 3600.0)
-    expected_consumption_until_9_kwh = (
-        hours_until_9 * avg_consumption_kwh_per_h * dishwasher_factor
-    )
-
-    # Minimum energy we should have NOW to still have reserve at 09:00
-    required_now_for_morning_kwh = expected_consumption_until_9_kwh + reserve_kwh
-    deficit_for_morning_reserve_kwh = max(
-        0.0, required_now_for_morning_kwh - current_battery_state
-    )
-
-    # --- Daytime load vs PV forecast ---
-    # PV forecast is not fully available to charge the battery, because a big part of it will be
-    # consumed by household load during the day (roughly 09:00–21:00).
-    daytime_load_kwh = 7.0
-
-    # Only PV beyond daytime load can be assumed to charge the battery (simplified model).
-    pv_available_for_battery_kwh = max(0.0, pv_kwh - daytime_load_kwh)
-
-    # Original goal: end of tomorrow = full battery (unless PV covers it)
-    needed_to_full = max(0.0, capacity - current_battery_state)
-    deficit_after_pv_for_full_kwh = max(
-        0.0, needed_to_full - pv_available_for_battery_kwh
-    )
-
-    # Final grid charging requirement: at least cover morning reserve deficit, and (optionally)
-    # also cover deficit-to-full after PV forecast.
-    deficit_after_pv = max(
-        deficit_for_morning_reserve_kwh, deficit_after_pv_for_full_kwh
-    )
-
-    print(
-        f"Morning reserve target: {reserve_fraction * 100:.0f}% ({reserve_kwh:.2f} kWh). "
-        f"Hours until 09:00: {hours_until_9:.2f}h. "
-        f"Expected consumption until 09:00: {expected_consumption_until_9_kwh:.2f} kWh. "
-        f"Deficit for morning reserve: {deficit_for_morning_reserve_kwh:.2f} kWh."
-    )
-
-    # Eligible slots by price cap
-    eligible_by_price = [
-        s for s in slots_all if s.price_czk_per_mwh <= args.max_price_czk_per_mwh
-    ]
-
-    # Window filter
-    wstart = parse_hhmm(args.window_start)
-    wend = parse_hhmm(args.window_end)
-    win_start_dt, win_end_dt = daterange_window(plan_date, wstart, wend, tz)
-
-    in_window = [
-        s
-        for s in eligible_by_price
-        if (s.start >= win_start_dt and s.end <= win_end_dt)
-    ]
-    out_window = [s for s in eligible_by_price if s not in in_window]
-
-    # Choose charging slots
-    if deficit_after_pv <= 0:
-        chosen: List[Slot] = []
-    else:
-        if args.prefer_window:
-            pool = in_window
-        else:
-            # try window first; if not enough slots, allow spill to any eligible slot
-            pool = in_window
-
-        chosen = pick_cheapest_slots(pool, deficit_after_pv, args.charge_power_kw)
-
-        if not args.prefer_window:
-            # If we couldn't get enough inside window, spill outside window
-            kwh_per_slot = args.charge_power_kw * 0.25
-            have_kwh = len(chosen) * kwh_per_slot
-            remaining = max(0.0, deficit_after_pv - have_kwh)
-            if remaining > 1e-9:
-                extra = pick_cheapest_slots(out_window, remaining, args.charge_power_kw)
-                chosen = sorted(chosen + extra, key=lambda s: s.start)
-
-    chosen_merged = merge_contiguous_slots(chosen)
-
-    # Report
-    print("\n=== Inputs ===")
-    print(f"Plan date (local):           {plan_date.isoformat()}")
-    print(f"OTE URL:                     {ote_url}")
-    print(f"CNB URL:                     {cnb_url}")
-    print(f"EUR→CZK rate used:           {eur_czk:.4f}")
-    print(f"Battery capacity:            {capacity:.2f} kWh")
-    print(f"Current battery energy:      {current_battery_state:.2f} kWh")
-    print(f"Forecast PV tomorrow (HA):   {pv_kwh:.2f} kWh")
-    print(f"Charge power:                {args.charge_power_kw:.2f} kW")
-    print(
-        f"Max price:                   {args.max_price_czk_per_mwh:.2f} CZK/MWh ({args.max_price_czk_per_mwh / 1000:.4f} CZK/kWh)"
-    )
-    print(
-        f"Eligible window:             {win_start_dt:%Y-%m-%d %H:%M} → {win_end_dt:%Y-%m-%d %H:%M} ({'ONLY' if args.prefer_window else 'preferred'})"
-    )
-
-    print("\n=== Decision ===")
-    print(f"Needed to full now:          {needed_to_full:.2f} kWh")
-    print(f"Deficit after PV forecast (full): {deficit_after_pv_for_full_kwh:.2f} kWh")
-    print(f"Grid charge needed (incl. morning reserve): {deficit_after_pv:.2f} kWh")
-
-    if not chosen:
-        print(
-            "\n✅ No grid charging needed (PV forecast should cover filling the battery)."
-        )
-        return 0
-
-    kwh_per_slot = args.charge_power_kw * 0.25
-    planned_kwh = len(chosen) * kwh_per_slot
-
-    # weighted average price
-    avg_price_czk_per_mwh = sum(s.price_czk_per_mwh for s in chosen) / max(
-        1, len(chosen)
-    )
-
-    print("\n⚡ Planned grid charging slots (15 min):")
-    for s in chosen:
-        print(
-            f"- {s.start:%Y-%m-%d %H:%M} → {s.end:%H:%M}  |  {s.price_czk_per_mwh:8.2f} CZK/MWh  ({s.price_czk_per_kwh:.4f} CZK/kWh)"
-        )
-
-    print("\n📌 Merged intervals (easier to execute):")
-    for s in chosen_merged:
-        print(
-            f"- {s.start:%Y-%m-%d %H:%M} → {s.end:%Y-%m-%d %H:%M}  |  {s.price_czk_per_mwh:8.2f} CZK/MWh"
-        )
-
-    print("\n=== Summary ===")
-    print(
-        f"Slots selected:              {len(chosen)} (≈ {planned_kwh:.2f} kWh at {kwh_per_slot:.2f} kWh/slot)"
-    )
-    print(
-        f"Average selected price:      {avg_price_czk_per_mwh:.2f} CZK/MWh ({avg_price_czk_per_mwh / 1000:.4f} CZK/kWh)"
-    )
-
-    # Optional: print HA service calls (you still need an automation/scheduler to run them at times)
-    if args.charger_switch:
-        print("\n=== Home Assistant service call snippets ===")
-        print("# Turn ON at each interval start, OFF at each interval end.")
-        print(
-            "# You can paste these into HA scripts or use an external scheduler (cron) calling HA REST API."
-        )
-        print("# curl examples:")
-        for s in chosen_merged:
-            on_time = s.start.strftime("%Y-%m-%d %H:%M:%S")
-            off_time = s.end.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n# Interval {on_time} → {off_time}")
-            print(
-                f"curl -s -X POST '{args.ha_base_url.rstrip('/')}/api/services/switch/turn_on' "
-                f"-H 'Authorization: Bearer {args.ha_token}' -H 'Content-Type: application/json' "
-                f'-d \'{{"entity_id":"{args.charger_switch}"}}\''
-            )
-            print(
-                f"curl -s -X POST '{args.ha_base_url.rstrip('/')}/api/services/switch/turn_off' "
-                f"-H 'Authorization: Bearer {args.ha_token}' -H 'Content-Type: application/json' "
-                f'-d \'{{"entity_id":"{args.charger_switch}"}}\''
-            )
-
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
