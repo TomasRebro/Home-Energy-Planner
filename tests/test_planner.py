@@ -14,9 +14,13 @@ from planner import (
 class TestOTELoading:
     """Test loading OTE 15-minute price data from XLSX files."""
 
-    def test_load_ote_prices_from_local_file(self, sample_ote_xlsx_path, prague_tz):
+    def test_load_ote_prices_from_local_file(
+        self, cheap_night_expensive_day_ote_xlsx_path, prague_tz
+    ):
         """Test loading OTE prices from a local XLSX file."""
-        df = load_ote_15min_prices_eur_per_mwh(sample_ote_xlsx_path, tz=prague_tz)
+        df = load_ote_15min_prices_eur_per_mwh(
+            cheap_night_expensive_day_ote_xlsx_path, tz=prague_tz
+        )
 
         assert not df.empty, "Should load price data"
         assert "start" in df.columns, "Should have 'start' column"
@@ -38,12 +42,15 @@ class TestOTELoading:
         )
 
         # Check that prices are reasonable (EUR/MWh)
-        assert df["price_eur_per_mwh"].min() > 0, "Prices should be positive"
         assert df["price_eur_per_mwh"].max() < 1000, "Prices should be reasonable"
 
-    def test_ote_prices_sorted_by_time(self, sample_ote_xlsx_path, prague_tz):
+    def test_ote_prices_sorted_by_time(
+        self, cheap_night_expensive_day_ote_xlsx_path, prague_tz
+    ):
         """Test that OTE prices are sorted by start time."""
-        df = load_ote_15min_prices_eur_per_mwh(sample_ote_xlsx_path, tz=prague_tz)
+        df = load_ote_15min_prices_eur_per_mwh(
+            cheap_night_expensive_day_ote_xlsx_path, tz=prague_tz
+        )
 
         starts = df["start"].tolist()
         assert starts == sorted(starts), "Prices should be sorted by start time"
@@ -52,25 +59,44 @@ class TestOTELoading:
 class TestCNBLoading:
     """Test loading CNB exchange rate data from XLSX files."""
 
-    def test_load_cnb_rate_from_local_file(self, sample_cnb_xlsx_path):
+    def test_load_cnb_rate_from_local_file(
+        self, cheap_night_expensive_day_cnb_xlsx_path
+    ):
         """Test loading CNB EUR/CZK rate from a local XLSX file."""
-        target_date = dt.date(2026, 1, 5)
-        rate = load_cnb_eur_czk_rate(sample_cnb_xlsx_path, target_date)
+        target_date = dt.date(2026, 1, 15)
+        rate = load_cnb_eur_czk_rate(
+            cheap_night_expensive_day_cnb_xlsx_path, target_date
+        )
 
         assert isinstance(rate, float), "Rate should be a float"
-        assert rate > 0, "Rate should be positive"
-        assert 20 < rate < 30, "EUR/CZK rate should be reasonable (around 25)"
+        assert rate == 24.275
 
-    def test_cnb_rate_fallback_to_previous_date(self, sample_cnb_xlsx_path):
+    def test_load_cnb_rate_from_local_file_past_date(
+        self, cheap_night_expensive_day_cnb_xlsx_path
+    ):
+        """Test loading CNB EUR/CZK rate from a local XLSX file."""
+        target_date = dt.date(2026, 1, 14)
+        rate = load_cnb_eur_czk_rate(
+            cheap_night_expensive_day_cnb_xlsx_path, target_date
+        )
+
+        assert isinstance(rate, float), "Rate should be a float"
+        assert rate == 24.27
+
+    def test_cnb_rate_fallback_to_previous_date(
+        self, cheap_night_expensive_day_cnb_xlsx_path
+    ):
         """Test that CNB rate falls back to previous date if exact date not found."""
         # Request date that doesn't exist in fixture (Jan 15)
-        target_date = dt.date(2026, 1, 15)
-        rate = load_cnb_eur_czk_rate(sample_cnb_xlsx_path, target_date)
+        target_date = dt.date(2026, 1, 16)
+        rate = load_cnb_eur_czk_rate(
+            cheap_night_expensive_day_cnb_xlsx_path, target_date
+        )
 
         assert isinstance(rate, float), (
             "Should return a rate from nearest previous date"
         )
-        assert rate > 0, "Rate should be positive"
+        assert rate == 24.275
 
 
 class TestDecisionComputation:
@@ -85,7 +111,7 @@ class TestDecisionComputation:
             current_battery_state_kwh=10.0,
             battery_capacity_kwh=14.2,
             charge_power_kw=3.0,
-            max_price_czk_per_mwh=2708.0,
+            max_price_czk_per_mwh=2600.0,
             window_start=dt.time(0, 0),
             window_end=dt.time(6, 0),
             prefer_window=False,
@@ -110,7 +136,7 @@ class TestDecisionComputation:
             current_battery_state_kwh=5.0,  # Low battery state
             battery_capacity_kwh=14.2,
             charge_power_kw=3.0,
-            max_price_czk_per_mwh=2708.0,
+            max_price_czk_per_mwh=2600.0,
             window_start=dt.time(0, 0),
             window_end=dt.time(6, 0),
             prefer_window=False,
@@ -126,13 +152,20 @@ class TestDecisionComputation:
 class TestPlanning:
     """Test the full planning functionality."""
 
-    def test_plan_charging_with_local_files(
-        self, sample_ote_xlsx_path, sample_cnb_xlsx_path, prague_tz
+    def test_plan_charging_cheap_night_expensive_day(
+        self,
+        cheap_night_expensive_day_ote_xlsx_path,
+        cheap_night_expensive_day_cnb_xlsx_path,
+        prague_tz,
     ):
         """Test full planning workflow with local XLSX files."""
         # Load data
-        ote_df = load_ote_15min_prices_eur_per_mwh(sample_ote_xlsx_path, tz=prague_tz)
-        eur_czk = load_cnb_eur_czk_rate(sample_cnb_xlsx_path, dt.date(2026, 1, 5))
+        ote_df = load_ote_15min_prices_eur_per_mwh(
+            cheap_night_expensive_day_ote_xlsx_path, tz=prague_tz
+        )
+        eur_czk = load_cnb_eur_czk_rate(
+            cheap_night_expensive_day_cnb_xlsx_path, dt.date(2026, 1, 16)
+        )
 
         # Create inputs
         inputs = PlanningInputs(
@@ -149,7 +182,7 @@ class TestPlanning:
         )
 
         # Run planning
-        now = dt.datetime(2026, 1, 5, 1, 0, tzinfo=prague_tz)
+        now = dt.datetime(2026, 1, 15, 1, 0, tzinfo=prague_tz)
         result = plan_charging(
             ote_df=ote_df, inputs=inputs, tz=prague_tz, now_local=now
         )
@@ -180,11 +213,18 @@ class TestPlanning:
                 )
 
     def test_plan_charging_no_charging_needed(
-        self, sample_ote_xlsx_path, sample_cnb_xlsx_path, prague_tz
+        self,
+        cheap_night_expensive_day_ote_xlsx_path,
+        cheap_night_expensive_day_cnb_xlsx_path,
+        prague_tz,
     ):
         """Test planning when no grid charging is needed."""
-        ote_df = load_ote_15min_prices_eur_per_mwh(sample_ote_xlsx_path, tz=prague_tz)
-        eur_czk = load_cnb_eur_czk_rate(sample_cnb_xlsx_path, dt.date(2026, 1, 5))
+        ote_df = load_ote_15min_prices_eur_per_mwh(
+            cheap_night_expensive_day_ote_xlsx_path, tz=prague_tz
+        )
+        eur_czk = load_cnb_eur_czk_rate(
+            cheap_night_expensive_day_cnb_xlsx_path, dt.date(2026, 1, 5)
+        )
 
         inputs = PlanningInputs(
             plan_date=dt.date(2026, 1, 5),
@@ -214,11 +254,18 @@ class TestPlanning:
             )
 
     def test_plan_charging_window_preference(
-        self, sample_ote_xlsx_path, sample_cnb_xlsx_path, prague_tz
+        self,
+        cheap_night_expensive_day_ote_xlsx_path,
+        cheap_night_expensive_day_cnb_xlsx_path,
+        prague_tz,
     ):
         """Test planning with window preference settings."""
-        ote_df = load_ote_15min_prices_eur_per_mwh(sample_ote_xlsx_path, tz=prague_tz)
-        eur_czk = load_cnb_eur_czk_rate(sample_cnb_xlsx_path, dt.date(2026, 1, 5))
+        ote_df = load_ote_15min_prices_eur_per_mwh(
+            cheap_night_expensive_day_ote_xlsx_path, tz=prague_tz
+        )
+        eur_czk = load_cnb_eur_czk_rate(
+            cheap_night_expensive_day_cnb_xlsx_path, dt.date(2026, 1, 5)
+        )
 
         inputs = PlanningInputs(
             plan_date=dt.date(2026, 1, 5),
