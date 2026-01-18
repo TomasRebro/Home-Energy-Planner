@@ -1,6 +1,7 @@
 """Tests for planner functionality using local XLSX files."""
 
 import datetime as dt
+import pytest
 
 from planner import (
     PlanningInputs,
@@ -197,20 +198,19 @@ class TestPlanning:
             "Result should contain merged slots"
         )
 
-        # If charging is needed, verify slots
-        if result.decision.grid_charge_needed_kwh > 0:
-            assert len(result.chosen_slots) > 0, (
-                "Should have chosen slots if charging needed"
-            )
-            assert len(result.merged_slots) > 0, (
-                "Should have merged slots if charging needed"
-            )
+        assert result.decision.grid_charge_needed_kwh == pytest.approx(10.79, abs=0.01)
+        assert len(result.chosen_slots) == 15, (
+            "Should have chosen slots if charging needed"
+        )
+        assert len(result.merged_slots) == 15, (
+            "Should have merged slots if charging needed"
+        )
 
-            # Verify slot prices are within max price
-            for slot in result.chosen_slots:
-                assert slot.price_czk_per_mwh <= inputs.max_price_czk_per_mwh, (
-                    f"Slot price {slot.price_czk_per_mwh} exceeds max {inputs.max_price_czk_per_mwh}"
-                )
+        # Verify slot prices are within max price
+        for slot in result.chosen_slots:
+            assert slot.price_czk_per_mwh <= inputs.max_price_czk_per_mwh, (
+                f"Slot price {slot.price_czk_per_mwh} exceeds max {inputs.max_price_czk_per_mwh}"
+            )
 
     def test_plan_charging_no_charging_needed(
         self,

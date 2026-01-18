@@ -446,7 +446,11 @@ def compute_decision(
 
     pv_available_for_battery_kwh = max(0.0, inputs.pv_kwh - inputs.daytime_load_kwh)
 
-    needed_to_full_kwh = max(0.0, capacity - inputs.current_battery_state_kwh)
+    # expected consumption is added to the battery capacity to account for consumption between planning and morning
+    needed_to_full_kwh = max(
+        0.0,
+        capacity + expected_consumption_until_9_kwh - inputs.current_battery_state_kwh,
+    )
     deficit_after_pv_for_full_kwh = max(
         0.0, needed_to_full_kwh - pv_available_for_battery_kwh
     )
