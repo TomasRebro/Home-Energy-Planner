@@ -392,7 +392,7 @@ class PlanningInputs:
     # Policy knobs (same defaults as before)
     reserve_fraction: float = 0.10
     avg_consumption_kwh_per_h: float = 0.300
-    dishwasher_factor: float = 1.10
+    dishwasher_consumption_kwh: float = 0.7
     daytime_load_kwh: float = 7.0
 
 
@@ -435,7 +435,8 @@ def compute_decision(
 
     hours_until_9 = max(0.0, (nine_am - now_local).total_seconds() / 3600.0)
     expected_consumption_until_9_kwh = (
-        hours_until_9 * inputs.avg_consumption_kwh_per_h * inputs.dishwasher_factor
+        hours_until_9 * inputs.avg_consumption_kwh_per_h
+        + inputs.dishwasher_consumption_kwh
     )
 
     required_now_for_morning_kwh = expected_consumption_until_9_kwh + reserve_kwh

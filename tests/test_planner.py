@@ -152,7 +152,7 @@ class TestDecisionComputation:
 class TestPlanning:
     """Test the full planning functionality."""
 
-    def test_plan_charging_cheap_night_expensive_day(
+    def test_plan_charging_cheap_night_expensive_day_slow_charging(
         self,
         cheap_night_expensive_day_ote_xlsx_path,
         cheap_night_expensive_day_cnb_xlsx_path,
@@ -175,14 +175,14 @@ class TestPlanning:
             current_battery_state_kwh=8.0,
             battery_capacity_kwh=14.2,
             charge_power_kw=3.0,
-            max_price_czk_per_mwh=2708.0,
+            max_price_czk_per_mwh=2600.0,
             window_start=dt.time(0, 0),
             window_end=dt.time(6, 0),
             prefer_window=False,
         )
 
         # Run planning
-        now = dt.datetime(2026, 1, 15, 1, 0, tzinfo=prague_tz)
+        now = dt.datetime(2026, 1, 15, 20, 0, tzinfo=prague_tz)
         result = plan_charging(
             ote_df=ote_df, inputs=inputs, tz=prague_tz, now_local=now
         )
