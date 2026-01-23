@@ -281,6 +281,14 @@ def main() -> int:
             f"- {s.start:%Y-%m-%d %H:%M} → {s.end:%Y-%m-%d %H:%M}  |  {s.price_czk_per_mwh:8.2f} CZK/MWh"
         )
 
+    ha_text_config = ",".join(
+        [
+            f"{s.start.hour:02d}{s.start.minute:02d}-{s.end.hour:02d}{s.end.minute:02d}"
+            for s in result.merged_slots
+        ]
+    )
+    print("HA text config: ", ha_text_config)
+
     print("\n=== Summary ===")
     print(
         f"Slots selected:              {len(result.chosen_slots)} (≈ {planned_kwh:.2f} kWh at {kwh_per_slot:.2f} kWh/slot)"

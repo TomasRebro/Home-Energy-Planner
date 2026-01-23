@@ -598,22 +598,27 @@ def merge_contiguous_slots(chosen: List[Slot]) -> List[Slot]:
     if not chosen:
         return []
     merged: List[Slot] = []
-    cur = chosen[0]
+    # Track the current group of contiguous slots
+    group_start = chosen[0].start
+    group_end = chosen[0].end
+    group_prices = [chosen[0].price_czk_per_mwh]
+
     for s in chosen[1:]:
-        if s.start == cur.end and math.isclose(
-            s.price_czk_per_mwh, cur.price_czk_per_mwh, rel_tol=0, abs_tol=1e-9
-        ):
-            # same price and contiguous -> merge
-            cur = Slot(
-                start=cur.start, end=s.end, price_czk_per_mwh=cur.price_czk_per_mwh
-            )
-        elif s.start == cur.end:
-            # contiguous but different price: still merge time-wise is OK for a real charger,
-            # but keep prices separate for transparency -> do NOT merge.
-            merged.append(cur)
-            cur = s
+        if s.start == group_end:
+            # Contiguous slot - merge into current group
+            group_end = s.end
+            group_prices.append(s.price_czk_per_mwh)
         else:
-            merged.append(cur)
-            cur = s
-    merged.append(cur)
+            # Not contiguous - finalize current group and start new one
+            avg_price = sum(group_prices) / len(group_prices)
+            merged.append(
+                Slot(start=group_start, end=group_end, price_czk_per_mwh=avg_price)
+            )
+            group_start = s.start
+            group_end = s.end
+            group_prices = [s.price_czk_per_mwh]
+
+    # Add the last group
+    avg_price = sum(group_prices) / len(group_prices)
+    merged.append(Slot(start=group_start, end=group_end, price_czk_per_mwh=avg_price))
     return merged
