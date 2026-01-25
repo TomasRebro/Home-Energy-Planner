@@ -13,6 +13,8 @@ import datetime as dt
 import os
 import sys
 
+import requests
+
 from planner import (
     PlanningInputs,
     build_cnb_url,
@@ -28,7 +30,50 @@ from planner import (
 )
 
 
+def send_pushover_notification(
+    message: str, title: str = "Home Energy Planner"
+) -> None:
+    """Send a notification via Pushover API."""
+    api_key = os.getenv("PUSHOVER_API_KEY")
+    user_key = os.getenv("PUSHOVER_USER_KEY")
+
+    if not api_key or not user_key:
+        print(
+            "⚠️  Pushover credentials not available; skipping notification",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        url = "https://api.pushover.net/1/messages.json"
+        payload = {
+            "token": api_key,
+            "user": user_key,
+            "title": title,
+            "message": message,
+        }
+        r = requests.post(url, json=payload, timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        print(
+            f"⚠️  Failed to send Pushover notification: {e}",
+            file=sys.stderr,
+        )
+
+
 def main() -> int:
+    try:
+        return _main()
+    except Exception as e:
+        error_msg = f"Planning failed: {str(e)}"
+        print(f"ERROR: {error_msg}", file=sys.stderr)
+        send_pushover_notification(
+            message=error_msg, title="Home Energy Planner - Error"
+        )
+        return 1
+
+
+def _main() -> int:
     tz = prague_tz()
 
     ap = argparse.ArgumentParser(
@@ -134,7 +179,7 @@ def main() -> int:
     if args.date:
         plan_date = dt.date.fromisoformat(args.date)
     else:
-        plan_date = (now + dt.timedelta(days=1)).date()
+        plan_date = (now + dt.timedelta(days=0)).date()
 
     # URLs (or local paths)
     ote_url = args.ote_url or build_ote_url(plan_date)
@@ -260,6 +305,11 @@ def main() -> int:
         print(
             "\n✅ No grid charging needed (PV forecast should cover filling the battery)."
         )
+        # Send notification for no charging needed
+        notification_msg = f"✅ No grid charging needed for {plan_date.isoformat()}\n(PV forecast should cover filling the battery)."
+        send_pushover_notification(
+            message=notification_msg, title="Home Energy Planner"
+        )
         return 0
 
     kwh_per_slot = inputs.charge_power_kw * 0.25
@@ -288,6 +338,32 @@ def main() -> int:
         ]
     )
     print("HA text config: ", ha_text_config)
+
+    # Set the HA helper variable
+    if args.ha_base_url and args.ha_token:
+        try:
+            url = args.ha_base_url.rstrip("/") + "/api/services/input_text/set_value"
+            headers = {
+                "Authorization": f"Bearer {args.ha_token}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "entity_id": "input_text.charge_windows",
+                "value": ha_text_config,
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=15)
+            r.raise_for_status()
+            print("✅ Updated input_text.charge_windows in Home Assistant")
+        except Exception as e:
+            print(
+                f"⚠️  Failed to update input_text.charge_windows: {e}",
+                file=sys.stderr,
+            )
+    elif not use_local_inputs:
+        print(
+            "⚠️  HA credentials not available; skipping input_text.charge_windows update",
+            file=sys.stderr,
+        )
 
     print("\n=== Summary ===")
     print(
@@ -325,6 +401,40 @@ def main() -> int:
                 f"-H 'Authorization: Bearer {args.ha_token}' -H 'Content-Type: application/json' "
                 f'-d \'{{"entity_id":"{args.charger_switch}"}}\''
             )
+
+    # Send Pushover notification with results
+    # Format merged slots
+    slots_text = "\n".join(
+        [
+            f"• {s.start:%H:%M} - {s.end:%H:%M} ({s.price_czk_per_mwh:.2f} CZK/MWh)"
+            for s in result.merged_slots
+        ]
+    )
+
+    # Calculate total charging time
+    total_minutes = sum(
+        int((s.end - s.start).total_seconds() / 60) for s in result.merged_slots
+    )
+    total_hours = total_minutes // 60
+    remaining_minutes = total_minutes % 60
+    if total_hours > 0:
+        total_time_str = (
+            f"{total_hours}h {remaining_minutes}min"
+            if remaining_minutes > 0
+            else f"{total_hours}h"
+        )
+    else:
+        total_time_str = f"{remaining_minutes}min"
+
+    notification_msg = (
+        f"Average price: {avg_price_czk_per_mwh:.2f} CZK/MWh\n"
+        f"Total charging time: {total_time_str}\n\n"
+        f"Time slots:\n{slots_text}"
+    )
+
+    send_pushover_notification(
+        message=notification_msg, title=f"⚡ Charging plan for {plan_date.isoformat()}"
+    )
 
     return 0
 
