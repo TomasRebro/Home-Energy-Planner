@@ -179,7 +179,7 @@ def _main() -> int:
     if args.date:
         plan_date = dt.date.fromisoformat(args.date)
     else:
-        plan_date = (now + dt.timedelta(days=0)).date()
+        plan_date = (now + dt.timedelta(days=1)).date()
 
     # URLs (or local paths)
     ote_url = args.ote_url or build_ote_url(plan_date)
