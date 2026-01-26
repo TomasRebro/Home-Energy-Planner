@@ -61,6 +61,43 @@ def send_pushover_notification(
         )
 
 
+def update_ha_charge_windows(
+    ha_base_url: str | None,
+    ha_token: str | None,
+    value: str,
+) -> None:
+    """Update Home Assistant input_text.charge_windows entity with the given value."""
+    if ha_base_url and ha_token:
+        try:
+            url = ha_base_url.rstrip("/") + "/api/services/input_text/set_value"
+            headers = {
+                "Authorization": f"Bearer {ha_token}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "entity_id": "input_text.charge_windows",
+                "value": value,
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=15)
+            r.raise_for_status()
+            if value:
+                print("✅ Updated input_text.charge_windows in Home Assistant")
+            else:
+                print(
+                    "✅ Updated input_text.charge_windows in Home Assistant (empty string)"
+                )
+        except Exception as e:
+            print(
+                f"⚠️  Failed to update input_text.charge_windows: {e}",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            "⚠️  HA credentials not available; skipping input_text.charge_windows update",
+            file=sys.stderr,
+        )
+
+
 def main() -> int:
     try:
         return _main()
@@ -310,6 +347,12 @@ def _main() -> int:
         send_pushover_notification(
             message=notification_msg, title="Home Energy Planner"
         )
+
+        # Set the HA helper variable to empty string when PV forecast covers battery needs
+        ha_text_config = ""
+        print("HA text config: ", ha_text_config)
+        update_ha_charge_windows(args.ha_base_url, args.ha_token, ha_text_config)
+
         return 0
 
     kwh_per_slot = inputs.charge_power_kw * 0.25
@@ -340,30 +383,7 @@ def _main() -> int:
     print("HA text config: ", ha_text_config)
 
     # Set the HA helper variable
-    if args.ha_base_url and args.ha_token:
-        try:
-            url = args.ha_base_url.rstrip("/") + "/api/services/input_text/set_value"
-            headers = {
-                "Authorization": f"Bearer {args.ha_token}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "entity_id": "input_text.charge_windows",
-                "value": ha_text_config,
-            }
-            r = requests.post(url, headers=headers, json=payload, timeout=15)
-            r.raise_for_status()
-            print("✅ Updated input_text.charge_windows in Home Assistant")
-        except Exception as e:
-            print(
-                f"⚠️  Failed to update input_text.charge_windows: {e}",
-                file=sys.stderr,
-            )
-    elif not use_local_inputs:
-        print(
-            "⚠️  HA credentials not available; skipping input_text.charge_windows update",
-            file=sys.stderr,
-        )
+    update_ha_charge_windows(args.ha_base_url, args.ha_token, ha_text_config)
 
     print("\n=== Summary ===")
     print(
