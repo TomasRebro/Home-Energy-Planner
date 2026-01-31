@@ -70,7 +70,7 @@ def build_ote_url(for_date: dt.date) -> str:
     # https://www.ote-cr.cz/pubweb/attachments/01/2026/month01/day05/DT_15MIN_05_01_2026_CZ.xlsx
     return (
         f"https://www.ote-cr.cz/pubweb/attachments/"
-        f"{for_date:%m}/{for_date:%Y}/month{for_date:%m}/day{for_date:%d}/"
+        f"01/{for_date:%Y}/month{for_date:%m}/day{for_date:%d}/"
         f"DT_15MIN_{for_date:%d_%m_%Y}_CZ.xlsx"
     )
 
@@ -78,7 +78,7 @@ def build_ote_url(for_date: dt.date) -> str:
 def build_cnb_url(for_date: dt.date) -> str:
     # Matches your example pattern:
     # https://www.ote-cr.cz/pubweb/attachments/01/2026/Kurzovni_listek_CNB_2026.xlsx
-    return f"https://www.ote-cr.cz/pubweb/attachments/{for_date:%m}/{for_date:%Y}/Kurzovni_listek_CNB_{for_date:%Y}.xlsx"
+    return f"https://www.ote-cr.cz/pubweb/attachments/01/{for_date:%Y}/Kurzovni_listek_CNB_{for_date:%Y}.xlsx"
 
 
 def get_bytes(url_or_path: str, timeout_s: int = 30) -> bytes:
